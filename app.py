@@ -28,7 +28,7 @@ def run_dummy_server():
 
 # --- CONFIGURATION ---
 # Render Environment Variables থেকে টোকেন নেবে, না পেলে ডিফল্ট বসবে
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8759872379:AAFAm7sZeLWCzM-GbQbHoJo8FtGWD2zFjDY")
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "9272421741:AAGfy3DYfBMjFWxnohGk96i-mwpibidj_kQ")
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 MAX_DEPTH = 2
