@@ -1,14 +1,15 @@
 import os
 import re
+import json
 import time
 import shutil
 import zipfile
 import asyncio
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, urljoin
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urlparse, urljoin
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -21,30 +22,56 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"Bot is running alive!")
 
 def run_dummy_server():
-    # Render নিজে থেকে একটি PORT এনভায়রনমেন্ট ভেরিয়েবল দেয়
     port = int(os.environ.get("PORT", 8080))
     server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
     server.serve_forever()
 
 # --- CONFIGURATION ---
-# Render Environment Variables থেকে টোকেন নেবে, না পেলে ডিফল্ট বসবে
+# Render Environment Variables থেকে টোকেন নেবে, না পেলে নিচের টোকেন ব্যবহার করবে
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "9272421741:AAGfy3DYfBMjFWxnohGk96i-mwpibidj_kQ")
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 MAX_DEPTH = 2
 MAX_PAGES = 20
 
+def format_cookies(cookie_raw):
+    """
+    ইউজার যদি JSON ফরম্যাট কিংবা সাধারণ স্ট্রিং পেস্ট করে,
+    উভয়কেই রিকোয়েস্টের উপযোগী Cookie স্ট্রিংয়ে রূপান্তর করবে।
+    """
+    if not cookie_raw:
+        return None
+    cookie_raw = cookie_raw.strip()
+    
+    # JSON ফরম্যাট চেক
+    if cookie_raw.startswith('[') and cookie_raw.endswith(']'):
+        try:
+            items = json.loads(cookie_raw)
+            return "; ".join([f"{item['name']}={item['value']}" for item in items if 'name' in item and 'value' in item])
+        except Exception:
+            pass
+            
+    return cookie_raw
+
 class BotScraper:
-    def __init__(self, url):
+    def __init__(self, url, raw_cookies=None):
         self.url = url
         self.domain = urlparse(url).netloc
         self.session = requests.Session()
-        self.session.headers.update({
+        
+        headers = {
             'User-Agent': USER_AGENT,
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.9',
             'Connection': 'keep-alive'
-        })
+        }
+        
+        # কুকি থাকলে হেডারে যুক্ত করা
+        parsed_cookie = format_cookies(raw_cookies)
+        if parsed_cookie:
+            headers['Cookie'] = parsed_cookie
+
+        self.session.headers.update(headers)
         
         self.visited_urls = set()
         self.downloaded_files = set()
@@ -70,20 +97,15 @@ class BotScraper:
 
     def fetch_page(self, url):
         try:
-            response = self.session.get(url, timeout=10)
+            response = self.session.get(url, timeout=12, allow_redirects=True)
             if response.status_code == 200:
                 return 200, response.content
-            if response.status_code == 403:
-                self.session.headers['Accept'] = 'text/html'
-                response2 = self.session.get(url, timeout=10)
-                if response2.status_code == 200:
-                    return 200, response2.content
             return response.status_code, None
         except Exception as e:
             return -1, str(e)
 
     def scan_for_apis(self, text_content, source_url):
-        patterns = re.findall(r'["\']([/\w\-]+/(?:api|v1|v2)/[\w\-/]+)["\']', text_content)
+        patterns = re.findall(r'["\']([/\w\-]+/(?:api|v1|v2|trpc)/[\w\-/]+)["\']', text_content)
         for endpoint in patterns:
             if endpoint.startswith('http') and urlparse(endpoint).netloc != self.domain:
                 continue
@@ -120,7 +142,7 @@ class BotScraper:
             os.makedirs(save_dir, exist_ok=True)
             save_path = os.path.join(save_dir, filename)
 
-            r = self.session.get(url, stream=True, timeout=5)
+            r = self.session.get(url, stream=True, timeout=6)
             if r.status_code == 200:
                 with open(save_path, 'wb') as f:
                     for chunk in r.iter_content(chunk_size=8192):
@@ -152,9 +174,7 @@ class BotScraper:
         status, content = self.fetch_page(url)
 
         if status != 200 or not content:
-            err_msg = f"Failed {url}: Status {status}"
             self.stats["errors"] += 1
-            self.error_log.append(err_msg)
             return
 
         path = urlparse(url).path.strip('/')
@@ -221,30 +241,40 @@ class BotScraper:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Hello! I am Website Source Downloader Bot.\n\n"
-        "Commands:\n"
-        "/download <url> - Download full source code & assets"
+        "👋 **Website Source Downloader Bot**\n\n"
+        "📌 **লগইন ছাড়া সাধারণ ওয়েবসাইট:**\n"
+        "`/download https://example.com`\n\n"
+        "🔐 **লগইন করা ওয়েবসাইট (কুকি সহ):**\n"
+        "`/download <URL> <Cookie-Data>`\n\n"
+        "*(Cookie-Editor থেকে Header String অথবা পুরো JSON পেস্ট করলেও কাজ করবে)*",
+        parse_mode="Markdown"
     )
 
 async def download(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("❌ Please provide a URL.\nUsage: /download https://example.com")
+        await update.message.reply_text("❌ URL প্রদান করুন।\nব্যবহার: `/download <url> [cookie]`", parse_mode="Markdown")
         return
 
     url = context.args[0]
+    raw_cookies = " ".join(context.args[1:]) if len(context.args) > 1 else None
+
     if not url.startswith(('http://', 'https://')):
         url = 'https://' + url
 
-    msg = await update.message.reply_text(f"🚀 Starting Download...\nTarget: {url}")
+    status_msg = f"🚀 শুরু হচ্ছে...\n🎯 টার্গেট: `{url}`"
+    if raw_cookies:
+        status_msg += "\n🔐 লগইন সেশন (Cookies) শনাক্ত করা হয়েছে!"
+
+    msg = await update.message.reply_text(status_msg, parse_mode="Markdown")
     zip_filename = None
 
     try:
-        scraper = BotScraper(url)
+        scraper = BotScraper(url, raw_cookies=raw_cookies)
         zip_filename = await asyncio.to_thread(scraper.run)
 
         file_size_mb = os.path.getsize(zip_filename) / (1024 * 1024)
         stats_text = (
-            f"✅ Download Complete!\n\n"
+            f"✅ **ডাউনলোড সফল হয়েছে!**\n\n"
             f"📄 Pages: {scraper.stats['pages']}\n"
             f"🖼️ Images: {scraper.stats['images']}\n"
             f"📜 Scripts: {scraper.stats['scripts']}\n"
@@ -252,10 +282,10 @@ async def download(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🔌 APIs: {scraper.stats['apis']}\n"
             f"📦 Size: {file_size_mb:.2f} MB"
         )
-        await msg.edit_text(stats_text)
+        await msg.edit_text(stats_text, parse_mode="Markdown")
 
         if file_size_mb > 49.5:
-            await update.message.reply_text("⚠️ ফাইল সাইজ ৫০MB-এর বেশি হওয়ায় পাঠানো যাচ্ছে না।")
+            await update.message.reply_text("⚠️ ফাইল সাইজ ৫০MB-এর বেশি হওয়ায় টেলিগ্রাম এপিআই দিয়ে পাঠানো সম্ভব নয়।")
         else:
             with open(zip_filename, 'rb') as f:
                 await context.bot.send_document(
@@ -264,7 +294,7 @@ async def download(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     caption=f"Source code for {url}"
                 )
     except Exception as e:
-        await msg.edit_text(f"❌ Error occurred: {str(e)}")
+        await msg.edit_text(f"❌ সমস্যা হয়েছে: {str(e)}")
     finally:
         if zip_filename and os.path.exists(zip_filename):
             os.remove(zip_filename)
